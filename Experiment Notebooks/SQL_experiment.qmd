@@ -1,0 +1,28 @@
+
+---
+title: "SQL Experiment"
+format: html
+execute:
+  echo: true
+jupyter: python3
+---
+
+```{python}
+
+import duckdb
+con = duckdb.connect("../data/weather.duckdb")
+
+```
+
+```{sql, connection=con, results='asis'}
+
+SELECT strftime('%m-%d', date) AS day_of_year,
+       city,
+       AVG(tmax) AS avg_tmax,
+       AVG(tmin) AS avg_tmin,
+       AVG(precip) AS avg_precip
+FROM daily_weather
+GROUP BY city, day_of_year
+ORDER BY day_of_year
+
+---

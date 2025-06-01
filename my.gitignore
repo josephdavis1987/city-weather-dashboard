@@ -1,0 +1,12 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+

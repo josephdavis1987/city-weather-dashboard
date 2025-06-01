@@ -1,0 +1,294 @@
+---
+title: "City Weather Analysis"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+# Setup
+```{python}
+
+# 🛠️ Setup
+import datetime
+import calendar
+import requests
+import duckdb
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+
+# Connect to your DuckDB database
+con = duckdb.connect("../data/weather.duckdb")
+```
+
+# LEOSS-cyclic code to 'wrap' the data
+### This is used later to help correct the LOESS error around edges
+
+```{python}
+
+def loess_cyclic(x, y, frac=0.1):
+    """
+    LOESS smoothing on a cyclic domain.
+    - x: 1D array of day-of-year (1…n)
+    - y: measurements (same length)
+    - frac: LOESS span (fraction of points)
+    Returns y_smoothed of length n.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    n = len(x)
+    # number of neighbors ≈ frac * n
+    k = max(int(frac * n), 1)
+
+    # build extended arrays: last k days mapped to -(n-k…n), then original, then first k days mapped to (n+1…n+k)
+    x_ext = np.concatenate((x[-k:] - n, x, x[:k] + n))
+    y_ext = np.concatenate((y[-k:], y, y[:k]))
+
+    # run LOESS on the extended series
+    sm_ext = lowess(y_ext, x_ext, frac=frac)
+    # sm_ext is sorted by x_ext, so sm_ext[:,1] aligns with x_ext
+
+    # extract just the middle block back
+    y_sm = sm_ext[k:k+n, 1]
+    return y_sm
+
+```
+
+# Filter for City
+```{python}
+
+# 1) Define a Python variable for the city:
+city = "Chattanooga"
+
+# Pull data just for city
+query = f"""
+SELECT *
+FROM daily_weather
+WHERE city = '{city}'
+"""
+
+city_df = con.execute(query).fetchdf()
+
+city_df[['t','tmax','tmin']] = city_df[['t','tmax','tmin']] * 9/5 + 32
+
+city_df.head()
+
+```
+
+# Summarize & compute LOESS with cyclic wrapping
+```{python}
+
+# 1) Summarize by day of year
+city_df['day_of_year'] = city_df['date'].dt.dayofyear
+agg = (
+    city_df
+      .groupby('day_of_year')
+      .agg(
+        avg_t=('t','mean'),
+        avg_min=('tmin','mean'),
+        avg_max=('tmax','mean'),        
+        min_t=('tmin','min'),
+        max_t=('tmax','max'),
+        avg_precip=("precip", "mean"),
+        min_precip=("precip", "min"),
+        max_precip=("precip", "max"),        
+        avg_cum_precip=("cum_precip", "mean"),
+        min_cum_precip=("cum_precip", "min"),
+        max_cum_precip=("cum_precip", "max")        
+      )
+      .reset_index()
+)
+
+# 1) Summarize by day of year
+city_df['day_of_year'] = city_df['date'].dt.dayofyear
+agg = (
+    city_df
+      .groupby('day_of_year')
+      .agg(
+        avg_t=('t','mean'),
+        avg_tmin=('tmin','mean'),
+        avg_tmax=('tmax','mean'),        
+        min_t=('tmin','min'),
+        max_t=('tmax','max'),
+        avg_precip=("precip", "mean"),
+        min_precip=("precip", "min"),
+        max_precip=("precip", "max"),        
+        avg_cum_precip=("cum_precip", "mean"),
+        min_cum_precip=("cum_precip", "min"),
+        max_cum_precip=("cum_precip", "max")        
+      )
+      .reset_index()
+)
+
+# choose a smoothing span: frac=0.1 means ~10% of the points in each local fit
+my_frac = 0.025
+
+# LOESS fits return an array of (x, smoothed_y)
+agg['tmin_loess']  = loess_cyclic(agg['day_of_year'], agg['avg_tmin'],  frac=my_frac)
+agg['tmax_loess'] = loess_cyclic(agg['day_of_year'], agg['avg_tmax'], frac=my_frac)
+
+
+
+agg.head()
+#agg.tail()
+```
+
+#  Call API for most recent year
+```{python}
+
+'''
+- **A)** loads your city list and grabs the lat/lon for whatever `city` you defined.  
+- **B)** sets the NASA POWER date range from January 1, 2025 to today.  
+- **C)** requests a JSON for T2M_MAX/T2M_MIN/PRECTOTCORR.  
+- **D)** builds a tiny `df2025` with date, tmax, tmin, precip, then converts temp to Fahrenheit.  
+- **E)** groups into a 2025‐only “record” DataFrame `agg2025` with columns `day_of_year`, `min_t2025`, `max_t2025`.
+'''
+
+# ── A) Find lat/lon for your city ────────────────────────────────────────────
+cities_path = "../data/Southeast_US_Cities.csv"
+cities_df   = pd.read_csv(cities_path)
+row         = cities_df.loc[cities_df["city"] == city].iloc[0]
+lat, lon    = float(row["lat"]), float(row["lon"])
+
+# ── B) Compute start/end for the 2025 fetch ─────────────────────────────────
+start_2025 = "20250101"
+today      = datetime.date.today()  # e.g. 2025-06-01
+end_2025   = today.strftime("%Y%m%d")  # "20250601", for example
+
+# ── C) Hit NASA POWER for T2M_MAX, T2M_MIN, PRECTOTCORR ────────────────────
+url_2025 = (
+    "https://power.larc.nasa.gov/api/temporal/daily/point"
+    f"?parameters=T2M_MAX,T2M_MIN,PRECTOTCORR"
+    f"&community=AG"
+    f"&longitude={lon}&latitude={lat}"
+    f"&start={start_2025}&end={end_2025}"
+    f"&format=JSON"
+)
+r2025 = requests.get(url_2025)
+data2025 = r2025.json()["properties"]["parameter"]
+
+# ── D) Build a DataFrame for 2025 values, then convert to °F ──────────────
+dates_2025 = list(data2025["T2M_MAX"].keys())
+df2025 = pd.DataFrame({
+    "date"  : pd.to_datetime(dates_2025, format="%Y%m%d"),
+    "tmax"  : list(data2025["T2M_MAX"].values()),
+    "tmin"  : list(data2025["T2M_MIN"].values()),
+    "precip": list(data2025["PRECTOTCORR"].values()),
+})
+# Convert to °F
+df2025[["tmax","tmin"]] = df2025[["tmax","tmin"]] * 9/5 + 32
+
+# Create day_of_year
+df2025["day_of_year"] = df2025["date"].dt.dayofyear
+
+# 1) Replace POWER’s missing‐data sentinels with NaN.
+#    NASA POWER uses −999 and -1766 for missing T2M_MAX/T2M_MIN/precip (and sometimes −99 or other codes).
+df2025 = df2025.replace({
+    "tmax": {-1766.2: np.nan},
+    "tmin": {-1766.2: np.nan},
+    "precip": {-999: np.nan}
+})
+
+# 2) (Optional) Drop any rows that are now fully missing—or just where both tmax & tmin are NaN.
+df2025 = df2025.dropna(subset=["tmax", "tmin", "precip"], how="all")
+
+#df2025.head()
+
+```
+
+# Build the figure
+```{python}
+
+# ── Compute month‐start ticks in "day_of_year" coordinates ────────────────
+# Use any non‐leap year (e.g. 2021) to map month→day_of_year:
+month_vals  = []
+month_names = []
+for m in range(1, 13):
+    dt = datetime.date(2021, m, 1)                  # choose 2021 (non‐leap) 
+    doy = dt.timetuple().tm_yday                    # day_of_year (1–365)
+    month_vals.append(doy)
+    month_names.append(calendar.month_abbr[m])      # e.g. "Jan", "Feb", …
+
+# ribbon + smoothed lines 
+fig = go.Figure()
+
+# ribbon (min→max range)
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.min_t,
+    mode='lines', line_color='rgba(0,0,0,0)', showlegend=False
+))
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.max_t,
+    mode='lines', fill='tonexty',
+    fillcolor='rgba(72, 194, 216, 0.3)',
+    line_color='rgba(0,0,0,0)',
+    name='Daily Record Values'
+))
+
+# 1) Invisible “bottom” trace for LOESS low
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year,
+    y=agg.tmin_loess,
+    mode='lines',
+    line=dict(color='rgba(0,0,0,0)'),  # fully transparent
+    showlegend=False
+))
+
+# 2) Filled “ribbon” top trace for LOESS high
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year,
+    y=agg.tmax_loess,
+    mode='lines',
+    fill='tonexty',                        # fill down to the previous trace
+    fillcolor='rgba(25, 50, 195, 0.2)',      # translucent blue
+    line=dict(color='rgba(25, 116, 195, 0)'),
+    name=f'Historic Average Range (LOESS frac={my_frac})'
+))
+
+# 2) Build a red ribbon between tmin→tmax for 2025
+fig.add_trace(go.Scatter(
+    x=df2025.day_of_year,
+    y=df2025.tmin,
+    mode='lines',
+    line=dict(color='rgba(0,0,0,0)'),
+    showlegend=False
+))
+fig.add_trace(go.Scatter(
+    x=df2025.day_of_year,
+    y=df2025.tmax,
+    mode='lines',
+    fill='tonexty',
+    fillcolor='rgba(255, 0, 0, 0.36)',    # translucent red
+    line_color='rgba(0,0,0,0)',
+    name='Live 2025 Range'
+))
+
+fig.update_layout(
+    title= f"{city}: Avg Temp by Day of Year with record values, 1990 - 2024, Live data starting 2025",
+    xaxis=dict(
+        title="Day of Year",
+        tickmode="array",
+        tickvals=month_vals,
+        ticktext=month_names,
+        tickangle=-45
+    ),
+    yaxis_title="Temperature (°F)",
+    height=650,
+    legend=dict(
+        x=0.005,            # 0 = left of plot, 1 = right of plot
+        y=0.98,            # 0 = bottom of plot, 1 = top of plot
+        xanchor="left",   # which side of the legend box is at x
+        yanchor="top",     # which side of the legend box is at y
+        bgcolor="rgba(255,255,255,0.7)",  # semi-transparent white
+        bordercolor="black",
+        borderwidth=1
+    )
+)
+fig.show()
+
+```

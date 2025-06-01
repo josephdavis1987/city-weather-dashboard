@@ -1,0 +1,137 @@
+---
+title: "01_get_data"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+# Setup: Imports
+```{python}
+
+import os
+import pandas as pd
+import requests
+import duckdb
+from pathlib import Path
+import time  # to be polite with API
+
+```
+
+# Setup: Paths
+```{python}
+# Paths
+
+data_dir = Path("../data")
+db_path = data_dir / "weather.duckdb"
+cities_path = data_dir / "Southeast_US_Cities.csv"  
+
+# Ensure folders exist
+data_dir.mkdir(parents=True, exist_ok=True)
+```
+
+```{python}
+print("Current working directory:", os.getcwd())
+print("📄 Loading cities from:", cities_path.resolve())
+print(cities_path.exists())
+```
+
+# Load List of Cities
+```{python}
+# Sample CSV structure:
+# city,lat,lon
+# Nashville,36.1627,-86.7816
+# Atlanta,33.7490,-84.3880
+
+cities_df = pd.read_csv(cities_path)
+cities_df
+
+```
+
+# Function: Fetch NASA Daily Data
+```{python}
+def fetch_daily_weather(lat, lon):
+    url = (
+        f"https://power.larc.nasa.gov/api/temporal/daily/point"
+        f"?parameters=T2M_MAX,T2M_MIN,T2M,PRECTOTCORR"
+        f"&community=AG"
+        f"&longitude={lon}&latitude={lat}"
+        f"&start=19900101&end=20241231"
+        f"&format=JSON"
+    )
+    print("🌐 URL:", url)
+    r = requests.get(url)
+    data = r.json()
+    try:
+        parameters = data['properties']['parameter']
+        dates = list(parameters['T2M_MAX'].keys())
+        raw = pd.DataFrame({
+            'date': dates,
+            't': list(parameters['T2M'].values()),
+            'tmax': list(parameters['T2M_MAX'].values()),
+            'tmin': list(parameters['T2M_MIN'].values()),
+            'precip': list(parameters['PRECTOTCORR'].values())
+        })
+        raw['date'] = pd.to_datetime(raw['date'])
+        return raw
+    except KeyError as e:
+        print(f"Missing data at lat={lat}, lon={lon}")
+        return None
+
+```
+
+# Loop and Append Results
+```{python}
+
+all_dfs = []
+
+for _, row in cities_df.iterrows():
+    city, lat, lon = row['city'], row['lat'], row['lon']
+    print(f"Fetching: {city} ({lat}, {lon})")
+
+    df = fetch_daily_weather(lat, lon)
+    if df is not None:
+        df['city'] = city
+        df['lat'] = lat
+        df['lon'] = lon
+        all_dfs.append(df)
+    
+    time.sleep(1)  # avoid hammering the API
+
+```
+
+# Save to DuckDB
+```{python}
+
+con = duckdb.connect(db_path.as_posix())
+con.execute("DROP TABLE IF EXISTS daily_weather")
+
+# Combine and save
+final_df = pd.concat(all_dfs)
+
+# ── A) Compute cumulative annual precip per city ──────────────────
+# Ensure 'date' is datetime (it already should be from fetch), then extract year
+final_df['date'] = pd.to_datetime(final_df['date'])
+final_df['year'] = final_df['date'].dt.year
+
+# Sort by city, year, then date so cumsum is correct
+final_df = final_df.sort_values(['city', 'year', 'date'])
+
+final_df['precip'] = final_df['precip'].replace(-999, np.nan).fillna(0)
+
+# Compute a new column 'cum_precip' that resets each year for each city
+final_df['cum_precip'] = (
+    final_df
+        .groupby(['city', 'year'])['precip']
+        .cumsum()
+)
+
+con.register("df", final_df)
+con.execute("CREATE TABLE daily_weather AS SELECT * FROM df")
+
+con.execute("SELECT COUNT(*) FROM daily_weather").fetchdf()
+con.close()
+
+```
+

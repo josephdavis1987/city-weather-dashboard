@@ -1,0 +1,150 @@
+---
+title: "Chattanooga Weather Analysis"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+# Setup
+```{python}
+
+# 🛠️ Setup
+import duckdb
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+# Connect to your DuckDB database
+con = duckdb.connect("../data/weather.duckdb")
+```
+
+# Filter for Chattanooga
+```{python}
+
+# Pull data just for Chattanooga
+query = """
+SELECT *
+FROM daily_weather
+WHERE city = 'Chattanooga'
+"""
+
+chatt_df = con.execute(query).fetchdf()
+
+chatt_df[['t','tmax','tmin']] = chatt_df[['t','tmax','tmin']] * 9/5 + 32
+
+chatt_df.head()
+
+```
+
+# Idea 1) Draw the ribbon
+```{python}
+
+# 1) Summarize by day of year
+chatt_df['day_of_year'] = chatt_df['date'].dt.dayofyear
+agg = (
+    chatt_df
+      .groupby('day_of_year')
+      .agg(
+        avg_t=('t','mean'),
+        min_t=('tmin','min'),
+        max_t=('tmax','max')
+      )
+      .reset_index()
+)
+
+chatt_df.head()
+
+# 2) Draw the ribbon
+fig = go.Figure()
+
+# invisible “bottom” trace for min
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.min_t,
+    mode='lines', line_color='rgba(0,0,0,0)', showlegend=False
+))
+
+# filled upper trace
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.max_t,
+    mode='lines',
+    fill='tonexty',
+    fillcolor='rgba(72, 168, 216, 0.3)',
+    line_color='rgba(0,0,0,0)',
+    name='Daily range (min→max)'
+))
+
+# average line on top
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.avg_t,
+    mode='lines',
+    line_color='blue',
+    name='10-yr average'
+))
+
+fig.update_layout(
+    title="Chattanooga: Avg Temp by Day of Year with Min–Max Ribbon",
+    xaxis_title="Day of Year",
+    yaxis_title="Temperature (°F)",
+    height=450
+)
+fig.show()
+
+```
+
+# Idea 2) Error bands on Mean
+
+```{python}
+
+# reuse the same agg DataFrame from above
+fig = px.line(
+    agg,
+    x='day_of_year',
+    y='avg_t',
+    error_y=agg['max_t'] - agg['avg_t'],
+    error_y_minus=agg['avg_t'] - agg['min_t'],
+    title="Chattanooga: Avg Temp by Day of Year with Error Bars",
+    labels={
+      'day_of_year':'Day of Year',
+      'avg_t':'Avg Temp (°F)'
+    }
+)
+fig.update_traces(line=dict(width=2), marker=dict(size=3))
+fig.update_layout(height=450)
+fig.show()
+
+```
+
+# Idea 3) Box-plot “stripe” per day (showing full distribution)
+```{python}
+
+# Build day_of_year on the raw df
+chatt_df['day_of_year'] = chatt_df['date'].dt.dayofyear
+
+# 1) Box plots of all daily t values across 5 years
+fig = px.box(
+    chatt_df,
+    x='day_of_year',
+    y='t',
+    points=False,   # hide individual dots
+    title="Chattanooga: Temp Distribution by Day of Year (5 years)",
+    labels={'day_of_year':'Day of Year','t':'Temperature (°F)'}
+)
+
+# 2) Overlay the 5-year average line
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year,
+    y=agg.avg_t,
+    mode='lines',
+    line_color='red',
+    name='5-yr average'
+))
+
+fig.update_layout(
+    xaxis=dict(tickmode='array', tickvals=[1,32,60,91,121,152,182,213,244,274,305,335]),
+    height=450
+)
+fig.show()
+
+```

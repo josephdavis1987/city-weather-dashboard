@@ -1,0 +1,53 @@
+---
+title: "01_get_data"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+
+```{python}
+
+#| echo: true
+import requests
+import pandas as pd
+from pathlib import Path
+
+#| echo: true
+data_dir = Path("../data")
+data_dir.mkdir(parents=True, exist_ok=True)
+
+#| echo: true
+# Example location (e.g., Nashville, TN)
+latitude = 36.1627
+longitude = -86.7816
+
+#| echo: true
+# NASA POWER API base URL for climatology (daily averages)
+url = (
+    f"https://power.larc.nasa.gov/api/temporal/climatology/point"
+    f"?parameters=T2M_MAX,T2M_MIN,PRECTOT"
+    f"&community=AG"
+    f"&longitude={longitude}&latitude={latitude}"
+    f"&format=JSON"
+)
+
+#| echo: true
+response = requests.get(url)
+data = response.json()
+
+#| echo: true
+# Preview the keys
+list(data.keys())
+
+```
+
+###Test
+
+
+```{python}
+for i in range(10):
+  print(i)
+```

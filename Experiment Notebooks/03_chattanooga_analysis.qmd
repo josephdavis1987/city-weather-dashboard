@@ -1,0 +1,149 @@
+---
+title: "Chattanooga Weather Analysis"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+# Setup
+```{python}
+
+# 🛠️ Setup
+import duckdb
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+
+# Connect to your DuckDB database
+con = duckdb.connect("../data/weather.duckdb")
+```
+
+# LEOSS-cyclic code to 'wrap' the data
+### This is used later to help correct the LOESS error around edges
+
+```{python}
+
+def loess_cyclic(x, y, frac=0.1):
+    """
+    LOESS smoothing on a cyclic domain.
+    - x: 1D array of day-of-year (1…n)
+    - y: measurements (same length)
+    - frac: LOESS span (fraction of points)
+    Returns y_smoothed of length n.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    n = len(x)
+    # number of neighbors ≈ frac * n
+    k = max(int(frac * n), 1)
+
+    # build extended arrays: last k days mapped to -(n-k…n), then original, then first k days mapped to (n+1…n+k)
+    x_ext = np.concatenate((x[-k:] - n, x, x[:k] + n))
+    y_ext = np.concatenate((y[-k:], y, y[:k]))
+
+    # run LOESS on the extended series
+    sm_ext = lowess(y_ext, x_ext, frac=frac)
+    # sm_ext is sorted by x_ext, so sm_ext[:,1] aligns with x_ext
+
+    # extract just the middle block back
+    y_sm = sm_ext[k:k+n, 1]
+    return y_sm
+
+```
+
+# Filter for Chattanooga
+```{python}
+
+# Pull data just for Chattanooga
+query = """
+SELECT *
+FROM daily_weather
+WHERE city = 'Chattanooga'
+"""
+
+chatt_df = con.execute(query).fetchdf()
+
+chatt_df[['t','tmax','tmin']] = chatt_df[['t','tmax','tmin']] * 9/5 + 32
+
+chatt_df.head()
+
+```
+
+# Idea 1) Draw the ribbon
+```{python}
+
+# 1) Summarize by day of year
+chatt_df['day_of_year'] = chatt_df['date'].dt.dayofyear
+agg = (
+    chatt_df
+      .groupby('day_of_year')
+      .agg(
+        avg_t=('t','mean'),
+        avg_min=('tmin','mean'),
+        avg_max=('tmax','mean'),        
+        min_t=('tmin','min'),
+        max_t=('tmax','max')
+      )
+      .reset_index()
+)
+
+# choose a smoothing span: frac=0.1 means ~10% of the points in each local fit
+my_frac = 0.07
+
+# LOESS fits return an array of (x, smoothed_y)
+agg['low_loess']  = loess_cyclic(agg['day_of_year'], agg['avg_min'],  frac=my_frac)
+agg['high_loess'] = loess_cyclic(agg['day_of_year'], agg['avg_max'], frac=my_frac)
+
+
+# ribbon + smoothed lines 
+fig = go.Figure()
+
+# ribbon (min→max range)
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.min_t,
+    mode='lines', line_color='rgba(0,0,0,0)', showlegend=False
+))
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.max_t,
+    mode='lines', fill='tonexty',
+    fillcolor='rgba(72,168,216,0.3)',
+    line_color='rgba(0,0,0,0)',
+    name='Daily range'
+))
+'''
+# raw daily averages
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.avg_min,
+    mode='lines', line_color='rgba(195,45,25,0.7)',
+    name='Avg Low (raw)'
+))
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.avg_max,
+    mode='lines', line_color='rgba(195,96,25,0.7)',
+    name='Avg High (raw)'
+))
+'''
+# LOESS‐smoothed averages
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.low_loess,
+    mode='lines', line=dict(color='rgb(25, 116, 195)', dash='dash'),
+    name=f'Avg Low (LOESS, frac={my_frac})'
+))
+fig.add_trace(go.Scatter(
+    x=agg.day_of_year, y=agg.high_loess,
+    mode='lines', line=dict(color='rgb(25, 116, 195)', dash='dash'),
+    name=f'Avg High (LOESS, frac={my_frac})'
+))
+
+fig.update_layout(
+    title="Chattanooga: Avg Temp by Day of Year with LOESS",
+    xaxis_title="Day of Year",
+    yaxis_title="Temperature (°F)",
+    height=450
+)
+fig.show()
